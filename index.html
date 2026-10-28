@@ -1,0 +1,136 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#16181d"><link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png"><title>Sketchpad</title>
+<style>
+:root{color-scheme:dark;--bg:#16181d;--bar:#22252c;--fg:#e8e8e8;--ac:#4ea1ff}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px system-ui;overflow:hidden;overscroll-behavior:none}
+#c{position:fixed;inset:0;touch-action:none;display:block}
+#bar{position:fixed;left:0;right:0;bottom:0;display:flex;flex-wrap:wrap;gap:4px;padding:6px 6px calc(6px + env(safe-area-inset-bottom));background:var(--bar);justify-content:center}
+#bar button,#bar label{min-width:48px;height:48px;border:0;border-radius:10px;background:#30343d;color:var(--fg);font-size:18px;display:flex;align-items:center;justify-content:center;padding:0 6px}
+#bar button.on{background:var(--ac);color:#000}#bar button:disabled{opacity:.35}
+input[type=color]{width:36px;height:36px;border:0;background:none;padding:0}input[type=range]{width:90px}
+#zoom{position:fixed;top:8px;right:8px;background:#0008;padding:4px 8px;border-radius:8px;font-size:12px}
+</style></head><body>
+<canvas id="c"></canvas><div id="zoom">100%</div>
+<div id="bar">
+<button id="t-pen" class="on" title="Pen">✏️</button><button id="t-line" title="Line">╱</button><button id="t-circle" title="Circle">◯</button><button id="t-eraser" title="Eraser">🧽</button>
+<label title="Color"><input id="color" type="color" value="#ffffff"></label>
+<label title="Width"><input id="width" type="range" min="1" max="40" value="4"></label>
+<button id="undo" title="Undo">↶</button><button id="redo" title="Redo">↷</button>
+<button id="sym" title="Mirror">⇋</button><button id="grid" title="Grid (5/10 mm)">#</button><button id="fit" title="Reset view">⤢</button>
+<button id="png" title="Save PNG">PNG</button><button id="svg" title="Export SVG">SVG</button><button id="clear" title="Clear">🗑</button>
+</div>
+<script>
+// World units: px at zoom 1. PX_PER_MM = 4 → SVG exported in mm.
+const PX_PER_MM=4,PAGE_W=800,PAGE_H=1600,KEY='sketchpad.v1';
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),$=id=>document.getElementById(id);
+let S={strokes:[],redo:[],grid:false,sym:false,tool:'pen',color:'#ffffff',width:4};
+let view={x:0,y:0,z:1},dpr=1,cur=null,pointers=new Map(),pinch=null,penActive=0,dirty=true;
+try{const d=JSON.parse(localStorage.getItem(KEY)||'null');if(d)Object.assign(S,d,{redo:d.redo||[]})}catch(e){}
+function save(){clearTimeout(save.t);save.t=setTimeout(()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}},300)}
+function resize(){dpr=devicePixelRatio||1;cv.width=innerWidth*dpr;cv.height=innerHeight*dpr;cv.style.width=innerWidth+'px';cv.style.height=innerHeight+'px';dirty=true}
+addEventListener('resize',resize);resize();
+function fit(){view.z=Math.min(innerWidth/PAGE_W,1);view.x=(innerWidth-PAGE_W*view.z)/2;view.y=0;dirty=true}
+const toW=(x,y)=>[(x-view.x)/view.z,(y-view.y)/view.z];
+// Stroke geometry → list of polylines (incl. mirror)
+function geom(s){let pts;
+ if(s.type==='line')pts=[s.p[0],s.p[s.p.length-1]];
+ else if(s.type==='circle'){const[a,b]=[s.p[0],s.p[s.p.length-1]],r=Math.hypot(b[0]-a[0],b[1]-a[1]);pts={c:a,r}}
+ else pts=s.p;
+ const out=[pts];
+ if(s.sym){const m=PAGE_W/2;out.push(pts.c?{c:[2*m-pts.c[0],pts.c[1]],r:pts.r}:pts.map(p=>[2*m-p[0],p[1],p[2]]))}
+ return out}
+function drawStroke(g,s){g.save();g.globalCompositeOperation=s.tool==='eraser'?'destination-out':'source-over';
+ g.strokeStyle=s.color;g.lineCap=g.lineJoin='round';
+ for(const pts of geom(s)){
+  if(pts.c){g.lineWidth=s.w;g.beginPath();g.arc(pts.c[0],pts.c[1],pts.r,0,7);g.stroke();continue}
+  if(pts.length===1){g.fillStyle=s.color;g.beginPath();g.arc(pts[0][0],pts[0][1],s.w*(pts[0][2]??.5),0,7);g.fill();continue}
+  // pressure-varying segments with quadratic midpoints
+  for(let i=1;i<pts.length;i++){const a=pts[i-1],b=pts[i],c=pts[i+1]||b;
+   g.lineWidth=s.w*2*(b[2]??.5);g.beginPath();
+   g.moveTo(i===1?a[0]:(pts[i-2][0]+a[0])/2,i===1?a[1]:(pts[i-2][1]+a[1])/2);
+   g.quadraticCurveTo(a[0],a[1],(a[0]+b[0])/2,(a[1]+b[1])/2);
+   if(i===pts.length-1)g.lineTo(b[0],b[1]);g.stroke()}
+ }g.restore()}
+function render(){if(!dirty)return requestAnimationFrame(render);dirty=false;
+ ctx.setTransform(1,0,0,1,0,0);ctx.fillStyle='#0d0e11';ctx.fillRect(0,0,cv.width,cv.height);
+ ctx.setTransform(dpr*view.z,0,0,dpr*view.z,dpr*view.x,dpr*view.y);
+ ctx.fillStyle='#16181d';ctx.fillRect(0,0,PAGE_W,PAGE_H);
+ if(S.grid){for(let mm=0;mm*PX_PER_MM<=Math.max(PAGE_W,PAGE_H);mm+=5){const v=mm*PX_PER_MM;ctx.strokeStyle=mm%10?'#ffffff14':'#ffffff30';ctx.lineWidth=1/view.z;
+  ctx.beginPath();ctx.moveTo(v,0);ctx.lineTo(v,PAGE_H);ctx.moveTo(0,v);ctx.lineTo(PAGE_W,v);ctx.stroke()}}
+ if(S.sym){ctx.strokeStyle='#4ea1ff66';ctx.setLineDash([8,8]);ctx.lineWidth=1/view.z;ctx.beginPath();ctx.moveTo(PAGE_W/2,0);ctx.lineTo(PAGE_W/2,PAGE_H);ctx.stroke();ctx.setLineDash([])}
+ // strokes on offscreen layer so eraser (destination-out) doesn't punch the page/grid
+ if(!render.l||render.l.width!==cv.width||render.l.height!==cv.height){render.l=new OffscreenCanvas(cv.width,cv.height)}
+ const l=render.l,g=l.getContext('2d');g.setTransform(1,0,0,1,0,0);g.clearRect(0,0,l.width,l.height);g.setTransform(ctx.getTransform());
+ for(const s of S.strokes)drawStroke(g,s);if(cur)drawStroke(g,cur);
+ ctx.setTransform(1,0,0,1,0,0);ctx.drawImage(l,0,0);
+ $('zoom').textContent=Math.round(view.z*100)+'%';$('undo').disabled=!S.strokes.length;$('redo').disabled=!S.redo.length;
+ requestAnimationFrame(render)}
+// Input
+function pressure(e){return e.pointerType==='pen'?Math.max(.1,e.pressure||.5):.5}
+cv.addEventListener('pointerdown',e=>{
+ if(e.pointerType==='pen'){penActive=Date.now()}
+ if(e.pointerType==='touch'&&Date.now()-penActive<1500)return; // palm rejection while pen in use
+ cv.setPointerCapture(e.pointerId);pointers.set(e.pointerId,{x:e.clientX,y:e.clientY,t:e.pointerType});
+ const touches=[...pointers.values()].filter(p=>p.t==='touch');
+ if(touches.length>=2){cur=null;startPinch();dirty=true;return} // second finger cancels stroke
+ if(pointers.size===1){const[x,y]=toW(e.clientX,e.clientY);
+  cur={tool:S.tool==='eraser'?'eraser':'pen',type:['line','circle'].includes(S.tool)?S.tool:'free',color:S.color,w:S.tool==='eraser'?S.width*3:S.width,sym:S.sym,p:[[x,y,pressure(e)]]};dirty=true}});
+cv.addEventListener('pointermove',e=>{
+ if(e.pointerType==='pen')penActive=Date.now();
+ if(!pointers.has(e.pointerId))return;pointers.get(e.pointerId).x=e.clientX;pointers.get(e.pointerId).y=e.clientY;
+ if(pinch){doPinch();return}
+ if(!cur)return;
+ const evs=e.getCoalescedEvents?e.getCoalescedEvents():[e];
+ for(const ev of (evs.length?evs:[e])){let[x,y]=toW(ev.clientX,ev.clientY);
+  if(cur.type!=='free'){cur.p[1]=[x,y,.5];continue}
+  const last=cur.p[cur.p.length-1],k=ev.pointerType==='pen'?.6:.45; // light exponential smoothing
+  x=last[0]+(x-last[0])*k;y=last[1]+(y-last[1])*k;
+  if(Math.hypot(x-last[0],y-last[1])*view.z<1.2)continue;
+  cur.p.push([+x.toFixed(2),+y.toFixed(2),+pressure(ev).toFixed(2)])}
+ dirty=true});
+function end(e){pointers.delete(e.pointerId);if(e.pointerType==='pen')penActive=Date.now();
+ if(pinch){if([...pointers.values()].filter(p=>p.t==='touch').length<2)pinch=null;return}
+ if(cur&&pointers.size===0){if(e.type!=='pointercancel'){S.strokes.push(cur);S.redo=[];save()}cur=null;dirty=true}}
+cv.addEventListener('pointerup',end);cv.addEventListener('pointercancel',end);
+function two(){const t=[...pointers.values()].filter(p=>p.t==='touch');return[t[0],t[1]]}
+function startPinch(){const[a,b]=two();pinch={d:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2,v:{...view}}}
+function doPinch(){const[a,b]=two();if(!a||!b)return;const d=Math.hypot(a.x-b.x,a.y-b.y),cx=(a.x+b.x)/2,cy=(a.y+b.y)/2;
+ const z=Math.min(8,Math.max(.2,pinch.v.z*d/pinch.d));const wx=(pinch.cx-pinch.v.x)/pinch.v.z,wy=(pinch.cy-pinch.v.y)/pinch.v.z;
+ view.z=z;view.x=cx-wx*z;view.y=cy-wy*z;dirty=true}
+cv.addEventListener('wheel',e=>{e.preventDefault();if(e.ctrlKey){const z=Math.min(8,Math.max(.2,view.z*Math.exp(-e.deltaY/200)));const[wx,wy]=toW(e.clientX,e.clientY);view.z=z;view.x=e.clientX-wx*z;view.y=e.clientY-wy*z}else{view.x-=e.deltaX;view.y-=e.deltaY}dirty=true},{passive:false});
+// UI
+const tools=['pen','line','circle','eraser'];
+function syncUI(){tools.forEach(t=>$('t-'+t).classList.toggle('on',S.tool===t));$('grid').classList.toggle('on',S.grid);$('sym').classList.toggle('on',S.sym);$('color').value=S.color;$('width').value=S.width;dirty=true}
+tools.forEach(t=>$('t-'+t).onclick=()=>{S.tool=t;syncUI();save()});
+$('color').oninput=e=>{S.color=e.target.value;save()};$('width').oninput=e=>{S.width=+e.target.value;save()};
+$('undo').onclick=()=>{if(S.strokes.length){S.redo.push(S.strokes.pop());save();dirty=true}};
+$('redo').onclick=()=>{if(S.redo.length){S.strokes.push(S.redo.pop());save();dirty=true}};
+$('clear').onclick=()=>{if(S.strokes.length&&confirm('Clear the whole sketch? (Undo is also reset)')){S.strokes=[];S.redo=[];save();dirty=true}};
+$('grid').onclick=()=>{S.grid=!S.grid;syncUI();save()};$('sym').onclick=()=>{S.sym=!S.sym;syncUI();save()};$('fit').onclick=fit;
+addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='z')$('undo').click();if(e.ctrlKey&&e.key==='y')$('redo').click()});
+function download(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),5000)}
+const stamp=()=>new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+function exportPNG(withGrid){const c=document.createElement('canvas');c.width=PAGE_W*2;c.height=PAGE_H*2;const g=c.getContext('2d');
+ const l=document.createElement('canvas');l.width=c.width;l.height=c.height;const lg=l.getContext('2d');lg.scale(2,2);S.strokes.forEach(s=>drawStroke(lg,s));
+ g.fillStyle='#16181d';g.fillRect(0,0,c.width,c.height);
+ if(withGrid){g.scale(2,2);for(let mm=0;mm*PX_PER_MM<=PAGE_H;mm+=5){const v=mm*PX_PER_MM;g.strokeStyle=mm%10?'#ffffff14':'#ffffff30';g.beginPath();g.moveTo(v,0);g.lineTo(v,PAGE_H);g.moveTo(0,v);g.lineTo(PAGE_W,v);g.stroke()}g.setTransform(1,0,0,1,0,0)}
+ g.drawImage(l,0,0);return new Promise(r=>c.toBlob(r,'image/png'))}
+// SVG: mm units. Eraser = SVG <mask> (black eraser strokes hide ink), so geometry stays vector-correct.
+function exportSVG(){const f=v=>(v/PX_PER_MM).toFixed(3),W=PAGE_W/PX_PER_MM,H=PAGE_H/PX_PER_MM;
+ const pathD=pts=>pts.c?`M${f(pts.c[0]-pts.r)} ${f(pts.c[1])}a${f(pts.r)} ${f(pts.r)} 0 1 0 ${f(2*pts.r)} 0a${f(pts.r)} ${f(pts.r)} 0 1 0 ${f(-2*pts.r)} 0`
+  :pts.length===1?`M${f(pts[0][0])} ${f(pts[0][1])}h0.001`:'M'+pts.map(p=>f(p[0])+' '+f(p[1])).join('L');
+ let body='',n=0; // each eraser stroke masks everything drawn before it
+ for(const s of S.strokes){const avgP=s.p.reduce((a,p)=>a+(p[2]??.5),0)/s.p.length,w=((s.type==='free'?s.w*2*avgP:s.w)/PX_PER_MM).toFixed(3);
+  const ds=geom(s).map(pathD).join('');
+  if(s.tool==='eraser'){const id='erase'+n++;body=`<mask id="${id}" maskUnits="userSpaceOnUse" x="0" y="0" width="${W}" height="${H}"><rect width="${W}" height="${H}" fill="#fff"/><path d="${ds}" stroke="#000" stroke-width="${w}" fill="none" stroke-linecap="round" stroke-linejoin="round"/></mask>\n<g mask="url(#${id})">\n${body}</g>\n`}
+  else body+=`<path d="${ds}" stroke="${s.color}" stroke-width="${w}" fill="none" stroke-linecap="round" stroke-linejoin="round"/>\n`}
+ const groups=[body];
+ return `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${W}mm" height="${H}mm" viewBox="0 0 ${W} ${H}">\n${groups.join('\n')}\n</svg>\n`}
+$('png').onclick=async()=>download(await exportPNG(S.grid&&confirm('Include grid in PNG?')),`sketch-${stamp()}.png`);
+$('svg').onclick=()=>download(new Blob([exportSVG()],{type:'image/svg+xml'}),`sketch-${stamp()}.svg`);
+window.__sketch={S,exportSVG,exportPNG,view};
+fit();syncUI();requestAnimationFrame(render);
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script></body></html>
